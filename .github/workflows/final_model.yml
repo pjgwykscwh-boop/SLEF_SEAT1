@@ -3,7 +3,7 @@ name: Run Script Daily at 6:00 seat_v6
 on:
   schedule:
     # 北京时间 6:00 = UTC 时间 22:00（前一天）
-    - cron: '55 21 * * *'
+    - cron: '50 21 * * *'
   workflow_dispatch:
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
 
       - name: Run ${{ matrix.script }} and save full log
         run: |
-          timeout 41m python ${{ matrix.script }} 2>&1 | tee output.log
+          timeout 59m python ${{ matrix.script }} 2>&1 | tee output.log
 
       - name: Encode full log for email (skip first 5 lines)
         id: encode_log
