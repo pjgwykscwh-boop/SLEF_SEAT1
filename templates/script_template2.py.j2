@@ -207,6 +207,7 @@ def handle_captcha_modal(driver):
             actions.click()
             actions.pause(0.4)
         actions.perform()
+        driver.save_screenshot(f"screenshots/captcha_click_{attempt}.png")
         time.sleep(0.5)
 
         confirm_btn = WebDriverWait(driver, 5).until(
@@ -1001,6 +1002,7 @@ def main():
             options.add_argument('--disable-extensions')
             options.add_argument('--disable-plugins')
             options.add_argument('--disable-images')  # 禁用图片加载，提高速度
+            options.add_argument('--window-size=1920,1080')
             options.add_argument('--headless=new')
             options.add_argument('--disable-gpu')
             options.add_argument('--no-sandbox')
