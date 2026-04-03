@@ -71,3 +71,4 @@ jobs:
           body: ${{ env.LOG_FULL }}
           attachments: |
             screenshots/screenshot_*.png
+            screenshots/captcha_click_*.png
