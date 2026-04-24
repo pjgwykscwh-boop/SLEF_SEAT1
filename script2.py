@@ -16,6 +16,9 @@ from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 import sys
 import os
+import time
+from datetime import datetime, timedelta, timezone
+import numpy as np
 
 '''your_account1,your_password1,start_time1,end_time1,
 your_account2,your_password2,start_time2,end_time2,your_preferroom,your_prefersit,'''
@@ -23,6 +26,71 @@ your_account2,your_password2,start_time2,end_time2,your_preferroom,your_prefersi
 
 
 ocr = ddddocr.DdddOcr(det=False, use_gpu=False)
+
+# ================= 全局初始化自定义 PaddleOCR 模型 =================
+_MODEL_DIR = "./ocr_model"
+
+import paddle
+import paddle.nn.functional as F
+import yaml as _yaml
+
+def _load_config(cfg_path):
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        return _yaml.safe_load(f)
+
+def _build_rec_model_native(model_dir):
+    """
+    使用 Paddle 工业级 Inference 引擎加载模型，
+    彻底绕过 jit.load 的环境兼容性 Bug。
+    """
+    import paddle.inference as paddle_infer
+    abs_model_dir = os.path.abspath(model_dir)
+    
+    # 明确指定 model 和 params 文件的绝对路径
+    model_file = os.path.join(abs_model_dir, "inference.pdmodel")
+    params_file = os.path.join(abs_model_dir, "inference.pdiparams")
+    
+    # 初始化推理配置
+    config = paddle_infer.Config(model_file, params_file)
+    config.disable_gpu()        # GitHub Actions 只有 CPU
+    config.enable_mkldnn()      # 开启 CPU 硬件加速
+    config.switch_ir_optim()    # 开启计算图优化
+    config.disable_glog_info()
+    # 创建终极预测器
+    predictor = paddle_infer.create_predictor(config)
+
+    # 读取字符表
+    dict_path = os.path.join(abs_model_dir, "ppocr_keys_v1.txt")
+    with open(dict_path, 'r', encoding='utf-8') as f:
+        char_list = [line.strip() for line in f if line.strip()]
+    
+    # CTCLabelDecode 字符表：blank + 字符 + space
+    char_dict = ['blank'] + char_list + [' ']
+    return predictor, char_dict
+
+def _preprocess_crop(pil_img, target_h=48, target_w=320):
+    """和训练时一致：保持宽高比缩放 + 右侧补0"""
+    import numpy as np
+    img = pil_img.convert('RGB')
+    orig_w, orig_h = img.size
+    scale = target_h / orig_h
+    new_w = min(int(orig_w * scale), target_w)
+    img = img.resize((new_w, target_h), Image.LANCZOS)
+    arr = np.array(img, dtype=np.float32).transpose(2, 0, 1) / 255.0
+    arr = (arr - 0.5) / 0.5
+    canvas = np.zeros((3, target_h, target_w), dtype=np.float32)
+    canvas[:, :, :new_w] = arr
+    return paddle.to_tensor(canvas[np.newaxis, :])
+
+print("正在初始化环境 (Template 2)...")
+try:
+    _rec_model, _char_dict = _build_rec_model_native(_MODEL_DIR)
+    print(f"✓ 自定义模型加载成功！字符表大小：{len(_char_dict)}")
+    CUSTOM_MODEL_LOADED = True
+except Exception as e:
+    print(f"✗ 自定义模型加载失败: {e}。将降级全部使用 ddddocr。")
+    CUSTOM_MODEL_LOADED = False
+# ============================================================================
 
 
 # 全天可约性检查，通用版
@@ -143,34 +211,117 @@ def idtf_imf(account, password, options):
         retry_count += 1
 
     raise Exception(f"达到最大重试次数 ({max_retries})，无法登录")
+
 def solve_click_captcha(driver):
-    # 精确选择器
     hint_img_elem = driver.find_element(By.CSS_SELECTOR, "img.captcha-text")
     bg_img_elem = driver.find_element(By.CSS_SELECTOR, ".captcha-modal-content img")
 
-    # 提示图OCR
+    # ---- 提示图：用 ddddocr 识别目标汉字（单字/多字均用此方式） ----
     hint_bytes = base64.b64decode(hint_img_elem.get_attribute("src").split(",")[1])
-    ocr = ddddocr.DdddOcr(det=False, use_gpu=False, show_ad=False)
-    raw = ocr.classification(hint_bytes)
-    chars_to_click = [c for c in raw if '\u4e00' <= c <= '\u9fff'][:1]
-    print(f"OCR原始: '{raw}' → 目标字: {chars_to_click}")
+    ocr_cls = ddddocr.DdddOcr(det=False, use_gpu=False, show_ad=False)
+    raw = ocr_cls.classification(hint_bytes)
+    chars_to_click = [c for c in raw if '\u4e00' <= c <= '\u9fff']  # 去掉[:1]
+    print(f"OCR原始: '{raw}' → 目标字: {chars_to_click} (共{len(chars_to_click)}个)")
 
-    # 背景图det定位
+    # ---- 背景图：用 ddddocr det 定位所有字框 ----
     bg_bytes = base64.b64decode(bg_img_elem.get_attribute("src").split(",")[1])
     det = ddddocr.DdddOcr(det=True, show_ad=False)
     bboxes = det.detection(bg_bytes)
-    bg_image = Image.open(BytesIO(bg_bytes))
+    bg_image = Image.open(BytesIO(bg_bytes)).convert("RGB")
 
     click_coords = []
-    for char in chars_to_click:
-        for bbox in bboxes:
+    used_bboxes = set()  # 避免同一个bbox被多个字重复使用
+
+    # 多字验证码（艺术字）：用训练模型的 softmax 概率匹配，准确率远高于字符串匹配
+    use_custom_model = CUSTOM_MODEL_LOADED and len(chars_to_click) > 1
+    if use_custom_model:
+        print("检测到多字验证码，启用自定义模型 softmax 概率匹配...")
+
+        # 对每个候选框跑模型，保存完整概率矩阵
+        crop_features = []
+        for i, bbox in enumerate(bboxes):
             x1, y1, x2, y2 = bbox
             cropped = bg_image.crop((max(0, x1 - 4), max(0, y1 - 4), x2 + 4, y2 + 4))
-            recognized = ocr.classification(cropped).strip()
-            if char in recognized:
-                click_coords.append(((x1 + x2) // 2, (y1 + y2) // 2))
-                print(f"✓ '{char}' 在坐标 ({(x1 + x2) // 2}, {(y1 + y2) // 2})")
-                break
+            tensor = _preprocess_crop(cropped)
+            input_data = tensor.numpy()  # Inference 引擎需要 numpy 格式
+            
+            # 喂入数据
+            input_names = _rec_model.get_input_names()
+            input_handle = _rec_model.get_input_handle(input_names[0])
+            input_handle.copy_from_cpu(input_data)
+            
+            # 执行推理
+            _rec_model.run()
+            
+            # 获取结果
+            output_names = _rec_model.get_output_names()
+            output_handle = _rec_model.get_output_handle(output_names[0])
+            preds_ndarray = output_handle.copy_to_cpu()
+            
+            # 计算 softmax 概率
+            # preds_ndarray 可能是 [B,T,C] 或 [T,C]，统一压成 [T,C] 再 softmax
+            if preds_ndarray.ndim == 3:
+                logits = preds_ndarray[0]          # [T, C]
+            else:
+                logits = preds_ndarray             # [T, C]
+            import scipy.special
+            prob_matrix = scipy.special.softmax(logits, axis=1)  # axis=1 对应字符维度C
+            crop_features.append({"idx": i, "bbox": bbox, "prob_matrix": prob_matrix})
+
+        # 按目标字顺序，逐个找概率最高的候选框（每框只用一次）
+        for char in chars_to_click:
+            try:
+                dict_idx = _char_dict.index(char)
+            except ValueError:
+                print(f"✗ '{char}' 不在字符表中，跳过")
+                continue
+
+            best_score, best_idx, best_bbox = -1.0, -1, None
+            for feat in crop_features:
+                if feat["idx"] in used_bboxes:
+                    continue
+                # 取该字在所有时间步上的最大概率作为得分
+                score = float(np.max(feat["prob_matrix"][:, dict_idx]))
+                if score > best_score:
+                    best_score, best_idx, best_bbox = score, feat["idx"], feat["bbox"]
+
+            if best_idx != -1:
+                used_bboxes.add(best_idx)
+                x1, y1, x2, y2 = best_bbox
+                coord = ((x1 + x2) // 2, (y1 + y2) // 2)
+                click_coords.append(coord)
+                print(f"✓ '{char}' → 坐标 {coord}  得分: {best_score:.4f}")
+            else:
+                print(f"✗ 未找到 '{char}'")
+
+    else:
+        # 单字验证码或模型未加载：沿用 ddddocr 字符串匹配
+        print("单字验证码或模型未加载，使用 ddddocr 识别背景字...")
+        candidate_preds = []
+        for i, bbox in enumerate(bboxes):
+            x1, y1, x2, y2 = bbox
+            cropped = bg_image.crop((max(0, x1 - 4), max(0, y1 - 4), x2 + 4, y2 + 4))
+            recognized = ocr_cls.classification(cropped).strip()
+            candidate_preds.append((i, bbox, recognized))
+            print(f"  候选框{i}: bbox={bbox}, 识别='{recognized}'")
+
+        for char in chars_to_click:
+            best_match = None
+            for i, bbox, recognized in candidate_preds:
+                if i in used_bboxes:
+                    continue
+                if char in recognized:
+                    best_match = (i, bbox)
+                    break  # 找到就停，按顺序匹配
+
+            if best_match:
+                i, (x1, y1, x2, y2) = best_match
+                used_bboxes.add(i)
+                coord = ((x1 + x2) // 2, (y1 + y2) // 2)
+                click_coords.append(coord)
+                print(f"✓ '{char}' 在坐标 {coord}")
+            else:
+                print(f"✗ 未找到 '{char}'")
 
     return click_coords, bg_img_elem, chars_to_click
 
@@ -180,8 +331,16 @@ def handle_captcha_modal(driver):
 
     for attempt in range(8):
         if attempt > 0:
+            # 检测系统繁忙提示，繁忙时加长等待
+            try:
+                busy_msg = driver.find_element(By.XPATH, "//*[contains(text(), '系统繁忙')]")
+                wait_seconds = 2 + attempt * 1.5  # 递增退避
+                print(f"检测到系统繁忙，等待{wait_seconds:.1f}秒后重试")
+                time.sleep(wait_seconds)
+            except NoSuchElementException:
+                time.sleep(1.2)  # 正常情况也稍微多等一点    
             driver.find_element(By.CSS_SELECTOR, "img.refresh").click()
-            time.sleep(0.8)
+            time.sleep(1.0)
 
         print(f"验证码第{attempt + 1}次尝试")
         click_coords, bg_elem, chars = solve_click_captcha(driver)
@@ -210,12 +369,32 @@ def handle_captcha_modal(driver):
         driver.save_screenshot(f"screenshots/captcha_click_{attempt}.png")
         time.sleep(0.5)
 
-        confirm_btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "button.confirm-btn"))
-        )
+        # 等待确认按钮变为可点击（而不是直接 until clickable）
+        try:
+            confirm_btn = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.confirm-btn:not([disabled])"))
+            )
+        except TimeoutException:
+            print(f"第{attempt+1}次：确认按钮未变为可点击，可能系统繁忙，继续重试")
+            continue
         driver.execute_script("arguments[0].click();", confirm_btn)
         print("已点击确定")
-        return True
+        time.sleep(1.0)
+
+        # 检测点击确认后是否弹出"验证码错误"提示
+        try:
+            err_elem = WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//*[contains(text(),'验证码错误') or contains(text(),'请重试')]")
+                )
+            )
+            print(f"验证码点击错误：{err_elem.text}，刷新重试...")
+            # 继续下一轮 attempt（不 return True）
+            continue
+        except TimeoutException:
+            # 没有错误提示，说明验证码通过了
+            print("验证码通过")
+            return True
 
     print("验证码多次失败")
     return False
@@ -346,13 +525,8 @@ def choose_it(driver, sit_avilable, idx, reading_room, day_type, max_attempts=50
                         submit_button = WebDriverWait(driver, 10).until(
                             EC.element_to_be_clickable((By.CSS_SELECTOR, ".el-button.submit-btn.el-button--default"))
                         )
-                        #
-                        if attempt >= 2:
-                            wait_until_open(opentime_text)
-                            submit_button.click()
-                        else:
-                            wait_until_630()
-                            submit_button.click()
+                        wait_until_630()
+                        submit_button.click()
                         try:
                             WebDriverWait(driver, 3).until(
                                 EC.presence_of_element_located((By.CSS_SELECTOR, "img.captcha-text"))
@@ -886,12 +1060,14 @@ def get_beijing_time():
 def wait_until_630():
     while True:
         now = get_beijing_time()
-        if now.hour > 6 or (now.hour == 6 and now.minute >= 29):
-            # print(f"当前北京时间 {now.strftime('%H:%M:%S')}，已过 6:29，开始执行任务。")
+        target = now.replace(hour=6, minute=30, second=1, microsecond=0)
+        if now >= target:
             break
+        remaining = (target - now).total_seconds()
+        if remaining > 1:
+            time.sleep(0.5)
         else:
-            # print(f"当前北京时间 {now.strftime('%H:%M:%S')}，未到 6:29，继续等待...")
-            time.sleep(1)  # 每 1 秒检查一次
+            time.sleep(0.05)  # 最后1秒内高频检查
 
 
 # 等待直到早上 6:25（北京时间）
