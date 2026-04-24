@@ -785,7 +785,7 @@ def date_whether(seat_dict, driver):
     found_full_day = False
     found_half_day = False
     # print(seat_dict)
-    random.seed(int("4032430182"))
+    random.seed(int("4032330028"))
     shuffled_keys = list(seat_dict.keys())
     random.shuffle(shuffled_keys)
     # 定义需要检查的时间段
@@ -1164,11 +1164,11 @@ import shutil
 def main():
     """主函数：循环登录多个账号并执行操作"""
     account_password4 = {
-        "4032430182": "000000",
-        "4032430182": "000000"
+        "4032330028": "000000",
+        "4032330028": "000000"
     }
     sit_avilable, day_type = None, None
-    users = {"自定义": [account_password4, "三楼智慧研修空间", "10"]}
+    users = {"自定义": [account_password4, "三楼智慧研修空间", "2"]}
     user = "自定义"
     total_accounts = list(users[user][0].items())
     reading_room = users[user][1]
